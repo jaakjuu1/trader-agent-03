@@ -38,8 +38,9 @@ class Settings(BaseSettings):
     SLIPPAGE: float = 0.5
     WALLET_PRIVATE_KEY: Optional[str]
     LOG_LEVEL: str = "INFO"
-    # Optionally pre-load the RugCheck API key; if not set, the bot will attempt to fetch one.
     API_KEY_RUGCHECK: Optional[str] = None
+    # DRY_RUN: When true, trades are simulated (useful for testing)
+    DRY_RUN: bool = True
 
     class Config:
         env_file = ".env"
@@ -50,6 +51,9 @@ settings = Settings()
 # --- Validate Critical Settings ---
 if not settings.WALLET_PRIVATE_KEY:
     raise ValueError("Critical environment variable missing: WALLET_PRIVATE_KEY")
+
+# --- Global DRY_RUN mode ---
+DRY_RUN = settings.DRY_RUN
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -238,7 +242,6 @@ class TokenState:
         self.trend_score = trend_score
 
     async def update_scam_risk(self) -> None:
-        # Weighted risk factors; these weights/thresholds may be tuned further.
         risk_factors = {
             'sniper_activity': (self.sniper_activity, 50, 0.3),
             'insider_trades': (self.insider_trades, 10, 0.2),
@@ -266,6 +269,16 @@ class Trader:
 
     async def execute_buy(self, token_state: TokenState,
                           amount_in_sol: float = settings.BUY_AMOUNT_SOL) -> bool:
+        if DRY_RUN:
+            logging.info(f"[SIMULATED] Buying {token_state.name} ({token_state.token_address}) for {amount_in_sol} SOL")
+            # Simulate output amount for testing
+            fake_out_amount = int(amount_in_sol * 1000)
+            buy_price = amount_in_sol / (fake_out_amount / (10 ** token_state.decimals))
+            holdings = fake_out_amount / (10 ** token_state.decimals)
+            await token_state.update_holdings(buy_price, holdings)
+            await save_token_to_db(token_state)
+            return True
+
         try:
             amount_in_units = int(amount_in_sol * 10**9)
             route = await get_swap_route(self.session, settings.SOL_ADDRESS,
@@ -300,6 +313,10 @@ class Trader:
             return False
 
     async def execute_sell(self, token_state: TokenState, amount_to_sell: float) -> bool:
+        if DRY_RUN:
+            logging.info(f"[SIMULATED] Selling {amount_to_sell:.4f} {token_state.name} ({token_state.token_address})")
+            return True
+
         try:
             amount_units = int(amount_to_sell * (10 ** token_state.decimals))
             route = await get_swap_route(self.session, token_state.token_address,
@@ -360,7 +377,6 @@ async def save_token_to_db(token_state: TokenState) -> None:
         logging.error(f"Database error for token {token_state.token_address}: {e}", exc_info=True)
 
 async def get_rugcheck_api_token(session: aiohttp.ClientSession) -> str:
-    """Obtain a RugCheck API token by signing an authentication message."""
     try:
         message = "Sign-in to Rugcheck.xyz"
         message_bytes = message.encode('utf-8')
@@ -408,7 +424,7 @@ async def monitor_and_trade() -> None:
                 logging.info("=== Market Check Started ===")
                 tokens = await fetch_new_tokens(session)
                 trends = await fetch_market_trends(session)
-                # Analyze and potentially buy tokens that meet our criteria.
+                # Analyze and potentially buy tokens that meet criteria.
                 for token in tokens:
                     token_address = token.get("address")
                     name = token.get("name", "Unknown")
@@ -421,7 +437,8 @@ async def monitor_and_trade() -> None:
                             token_state.trend_score >= settings.TREND_SCORE_MIN and
                             token_state.scam_risk < settings.SCAM_RISK_MAX):
                             await trader.execute_buy(token_state)
-                # Check existing holdings and sell if profitable.
+
+                # Check holdings and evaluate for potential sells.
                 async with aiosqlite.connect("meme_tokens.db") as conn:
                     cursor = await conn.execute(
                         "SELECT token_address, name, buy_price, holdings, decimals FROM tokens WHERE holdings > 0")
@@ -431,7 +448,7 @@ async def monitor_and_trade() -> None:
                         token_state = TokenState(token_address, name, decimals)
                         token_state.buy_price = buy_price
                         token_state.holdings = holdings
-                        # Estimate current price with a small test swap (e.g., 0.001 tokens).
+                        # Estimate current price using a small test swap (e.g., 0.001 tokens).
                         route = await get_swap_route(session, token_address, settings.SOL_ADDRESS,
                                                      str(int(0.001 * (10 ** decimals))))
                         if route and "data" in route:
@@ -440,11 +457,19 @@ async def monitor_and_trade() -> None:
                                 continue
                             current_price = sol_received / 0.001
                             profit_multiplier = current_price / token_state.buy_price
+                            # Log potential wins and losses.
+                            if profit_multiplier < 1:
+                                logging.info(f"Potential Loss: {token_state.name} at {current_price:.4f} SOL/token, below buy price {token_state.buy_price:.4f} SOL")
+                            else:
+                                logging.info(f"Potential Profit: {token_state.name} at {profit_multiplier:.2f}x multiplier")
+                            
                             if profit_multiplier >= settings.PROFIT_MULTIPLIER_MAX:
+                                logging.info(f"Triggering full sell for {token_state.name} at {profit_multiplier:.2f}x profit")
                                 await trader.execute_sell(token_state, token_state.holdings)
                                 await conn.execute("UPDATE tokens SET holdings = 0 WHERE token_address = ?", (token_address,))
                             elif profit_multiplier >= settings.PROFIT_MULTIPLIER_MIN:
                                 amount_to_sell = token_state.holdings * settings.SELL_PERCENTAGE
+                                logging.info(f"Triggering partial sell for {token_state.name}: selling {amount_to_sell:.4f} tokens at {profit_multiplier:.2f}x profit")
                                 await trader.execute_sell(token_state, amount_to_sell)
                                 await conn.execute("UPDATE tokens SET holdings = ? WHERE token_address = ?",
                                                    (token_state.holdings - amount_to_sell, token_address))

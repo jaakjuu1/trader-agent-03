@@ -1,0 +1,8 @@
+aiohttp
+aiosqlite
+async_solana
+solders
+solana
+tenacity
+spl-token
+pydantic
